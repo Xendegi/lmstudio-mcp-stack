@@ -1,9 +1,22 @@
 [project]
-name = "lmstudio-manager"
-version = "0.2.0"
-description = "MCP server that manages LM Studio models, benchmarks hardware (CPU/RAM/GPU), and exposes system health over SSE or stdio"
+name = "lmstudio-mcp-stack"
+version = "0.3.0"
+description = "MCP servers for LM Studio model management, ComfyUI image generation, and VRAM arbitration — accessible remotely over SSE"
+readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
+keywords = ["mcp", "lm-studio", "comfyui", "vram", "ai", "agent"]
+authors = [
+    {name = "Staid", email = "staid@users.noreply.github.com"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "mcp>=1.0",
     "httpx>=0.27",
@@ -12,6 +25,16 @@ dependencies = [
 
 [project.optional-dependencies]
 wmi = ["pywin32>=306"]
+comfyui = ["torch>=2.5", "torchvision", "safetensors", "transformers", "scipy"]
 
 [project.urls]
-repository = "https://github.com/anomalyco/lmstudio-manager"
+repository = "https://github.com/athenamiro/lmstudio-mcp-stack"
+homepage = "https://github.com/athenamiro/lmstudio-mcp-stack"
+
+[project.scripts]
+lmstudio-manager = "lmstudio_manager:main"
+comfyui-manager = "comfyui_manager:main"
+vram-manager = "vram_manager:main"
+
+[tool.setuptools.packages.find]
+include = ["lmstudio_manager*", "comfyui_manager*", "vram_manager*"]
