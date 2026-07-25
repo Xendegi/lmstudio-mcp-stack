@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+*.log.err
+*.pid
+
+# LM Studio model cache (publisher directories)
+26-07-19/
+AstraiaAI/
+AtomicChat/
+Bonsai/
+HF/
+HKEY_CLASSES_ROOT/
+LM Studio/
+LiquidAI/
+LocalAI-io/
+Notepad++
+NousResearch/
+PDFCreator
+Shadow0482/
+Take/
+WithinUsAI/
+aLKHoEbI/
+bartowski/
+google/
+lmstudio-community/
+mradermacher/
+shuhulx/
+slevinw/
+unsloth/
+server/
+
+# Registry / system files
+*.reg
+check_*.ps1
+fix_*.ps1
+recover_*.ps1
+find_*.ps1
+restore_*.ps1
+
+# UI dumps / config exports
+ui*.xml
+context-menu-backup-*/
+
+# Temp / test files
+temp_*
+test_*
+build_output.txt
+log_*.txt
+list_models_check.py
+screen.png
+vpn_screen*.png
+
+# Private config
+lmstudio_mcp_data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ComfyUI (separate repo)
+ComfyUI/
+
+# Compiled
+*.exe
+*.dll
