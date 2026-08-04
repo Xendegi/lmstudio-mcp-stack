@@ -566,7 +566,7 @@ lmstudio-mcp-stack/
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Self
 
 ## Acknowledgements
 
@@ -575,3 +575,9 @@ MIT — see [LICENSE](LICENSE).
 - [Stability AI](https://stability.ai) — Stable Diffusion 3.5 Medium
 - [Model Context Protocol](https://modelcontextprotocol.io) — MCP specification
 - [Hermes](https://github.com/NousResearch/hermes) — AI agent framework
+
+## Built By
+
+**[Athena Miro](https://github.com/athenamiro)** — building tools, shipping code, getting wiser.
+
+*Guided by Amir.*
