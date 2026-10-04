@@ -107,7 +107,7 @@ If you already have LM Studio and ComfyUI installed with Python:
 
 ```powershell
 # 1. Clone this repo
-git clone https://github.com/athenamiro/lmstudio-mcp-stack
+git clone https://github.com/Xendegi/lmstudio-mcp-stack
 cd lmstudio-mcp-stack
 
 # 2. Run the auto-installer
@@ -199,7 +199,7 @@ C:\ComfyUI\.venv\Scripts\python C:\ComfyUI\main.py --quick-test-for-ci
 
 ```powershell
 # Clone this repo
-git clone https://github.com/athenamiro/lmstudio-mcp-stack
+git clone https://github.com/Xendegi/lmstudio-mcp-stack
 cd lmstudio-mcp-stack
 
 # Create environment and install deps

@@ -28,8 +28,8 @@ wmi = ["pywin32>=306"]
 comfyui = ["torch>=2.5", "torchvision", "safetensors", "transformers", "scipy"]
 
 [project.urls]
-repository = "https://github.com/athenamiro/lmstudio-mcp-stack"
-homepage = "https://github.com/athenamiro/lmstudio-mcp-stack"
+repository = "https://github.com/Xendegi/lmstudio-mcp-stack"
+homepage = "https://github.com/Xendegi/lmstudio-mcp-stack"
 
 [project.scripts]
 lmstudio-manager = "lmstudio_manager:main"
