@@ -53,6 +53,11 @@ context-menu-backup-*/
 # Temp / test files
 temp_*
 test_*
+# ...but a PERMANENT regression suite must be versioned, or it silently rots.
+# test_unload.py is the witness stone for lmstudio_manager's load/unload
+# (stale-instance-id 404, premature 200, no-op honesty, embedder protection):
+# untracking it would leave the fix unverified by the next change.
+!test_unload.py
 build_output.txt
 log_*.txt
 list_models_check.py
