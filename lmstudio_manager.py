@@ -72,9 +72,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "/api/v1/chat",
         ],
     },
-    "main_model": "qwen/qwen3.5-9b",
+    "main_model": "opus4.7-gods.ghost.codex-4b.gguf",
     "auto_unload_aux": True,
-    "auto_unload_interval_seconds": 30,
+    "auto_unload_interval_seconds": 60,
+    "lms_path": str(Path.home() / ".lmstudio" / "bin" / "lms.exe"),
     "benchmark": {
         "repeat_count": 1,
         "max_tokens": 120,
@@ -704,6 +705,172 @@ def get_gpu_info() -> list[dict[str, Any]]:
     return nvidia
 
 
+def live_loaded_instances(model_name: str | None = None) -> list[dict[str, Any]]:
+    """The AUTHORITATIVE list of loaded instances, read from the server NOW.
+
+    Why this exists (2026-10-05): `unload_model_internal()` used to trust
+    `state["loaded_instance_id"]`, a CACHED value. LM Studio mints instance ids
+    like `qwen3-8b`, and on a re-load of the same model it mints `qwen3-8b:2`.
+    The cache kept the stale `:2` after the server had dropped it, so unload
+    POSTed a dead id and the server answered 404 - while the manager still
+    reported a loaded model. **A cache is a belief; the endpoint is the fact.**
+
+    Returns [{"id", "model_key", "type", "display_name"}, ...].
+    """
+    listed = list_models_internal()
+    if not listed.get("ok"):
+        return []
+    found: list[dict[str, Any]] = []
+    for model in listed.get("models", []):
+        mid = model.get("id")
+        if model_name and mid != model_name and model.get("name") != model_name:
+            continue
+        for inst in (model.get("loaded_instances") or []):
+            iid = inst.get("id") if isinstance(inst, dict) else inst
+            if iid:
+                found.append({
+                    "id": iid,
+                    "model_key": mid,
+                    "type": (model.get("raw") or {}).get("type", "llm"),
+                    "display_name": model.get("name") or mid,
+                })
+    return found
+
+
+def unload_model_internal(model_name: str | None = None) -> dict[str, Any]:
+    """Unload, then PROVE it.
+
+    Three defects fixed (all reproduced before the fix, see the test file):
+
+    1. It un-loaded from `state["loaded_instance_id"]` - a stale cached id with
+       a `:<n>` suffix that the server no longer knows -> HTTP 404 and a bare
+       "HTTP 404" error with no body. Now the id is resolved live first.
+    2. It walked `model_unload_endpoints` in order and returned the LAST
+       failure, so a correct endpoint's 404 was masked by two endpoints that
+       do not exist on this build (`/v1/models/unload`, `/api/v1/model/unload`
+       -> both "Unexpected endpoint or method"). The working endpoint is
+       `/api/v1/models/unload` and it needs `{"instance_id": ...}`; the other
+       payload keys the code tried (`model`, `identifier`) are not accepted by
+       this API (400 "Missing required field 'instance_id'").
+    3. It reported `ok: true` on the HTTP 200 and did not check that the
+       instance had actually left. **The 200 arrives BEFORE the model is
+       gone** - the server still lists it for a moment afterwards. A caller
+       that trusts the 200 is trusting a premature receipt. Now we poll until
+       the instance disappears, and report `verified`.
+
+    `unload_model()` with no argument unloads ALL loaded llm instances (one
+    call per instance) - which is the only sensible reading of "unload", and it
+    is what the cached single-instance state could never express. Embedding
+    models are left alone unless explicitly named: the memory port needs the
+    nomic embedder resident.
+    """
+    config = get_config()
+
+    # 1. resolve the truth from the server, not from the cache
+    live = live_loaded_instances(model_name)
+    cached_id = get_state().get("loaded_instance_id")
+
+    # An UNNAMED unload frees VRAM, so it means "every llm". It must NOT take
+    # the embedding model with it: the memory port's embed.py needs the nomic
+    # embedder resident, and losing it turns an unload into an outage.
+    # (Caught by test_unload.py gate 6 on 2026-10-05 - the first version of
+    # this function documented the protection and did not implement it.)
+    if model_name is None:
+        embedders = [i for i in live if i.get("type") == "embedding"]
+        live = [i for i in live if i.get("type") != "embedding"]
+        if embedders:
+            log_event("unload_skipped_embedders",
+                      {"kept": [e["id"] for e in embedders]})
+    if not live and cached_id:
+        # nothing resident, yet we believed something was loaded: report the
+        # drift instead of silently "succeeding".
+        log_event("unload_skipped_stale_state", {"cached_instance_id": cached_id})
+
+    targets = live
+    if not targets:
+        state = get_state()
+        state["loaded_instance_id"] = None
+        if model_name is None:
+            state["loaded_model_name"] = None
+        save_state(state)
+        note = (f"no llm model was loaded; "
+                f"{len(live_loaded_instances())} embedding model(s) kept resident"
+                if model_name is None else f"{model_name} was not loaded")
+        return {
+            "ok": True,
+            "verified": True,
+            "unloaded": [],
+            "note": note,
+            "stale_cached_instance_id": cached_id,
+        }
+
+    endpoint = config["lmstudio"]["model_unload_endpoints"][0]  # /api/v1/models/unload
+    unloaded: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    for inst in targets:
+        iid = inst["id"]
+        # 2. correct endpoint + the one field this API actually requires
+        endpoint, result = try_endpoints(
+            "POST", [endpoint], payload={"instance_id": iid}, timeout=120)
+        if not result.ok:
+            failed.append({"instance_id": iid, "status": result.status,
+                           "error": result.error_message})
+            continue
+
+        # 3. the 200 is not proof - poll until the instance is actually gone
+        gone, waited = wait_for_instance_gone(iid, timeout_s=120)
+        unloaded.append({
+            "instance_id": iid,
+            "model_key": inst.get("model_key"),
+            "verified": gone,
+            "drain_seconds": round(waited, 1),
+            "http_status": result.status,
+        })
+
+    state = get_state()
+    # Reconcile the cache against LLM instances only. An embedder is resident
+    # by design and must never be written into the "loaded model" slot - that
+    # is how the cache came to claim a model that was not there at all.
+    still_llm = [i for i in live_loaded_instances() if i.get("type") != "embedding"]
+    state["loaded_instance_id"] = still_llm[0]["id"] if still_llm else None
+    state["loaded_model_name"] = still_llm[0].get("model_key") if still_llm else None
+    save_state(state)
+
+    if failed and not unloaded:
+        log_event("model_unload_failed", {"failed": failed})
+        return {"ok": False, "error": failed[0].get("error"), "status": failed[0].get("status", 0),
+                "failed": failed}
+
+    ok = all(u["verified"] for u in unloaded) and not failed
+    log_event("model_unloaded", {"unloaded": unloaded, "failed": failed, "verified": ok})
+    invalidate_chat_endpoint_cache()
+    return {
+        "ok": ok,
+        "verified": ok,
+        "endpoint": endpoint,
+        "unloaded": unloaded,
+        "failed": failed,
+        "still_loaded": live_loaded_instances(),
+        "note": None if ok else "unload returned 200 but an instance is still resident",
+    }
+
+
+def wait_for_instance_gone(instance_id: str, timeout_s: int = 120, step_s: float = 1.0) -> tuple[bool, float]:
+    """Poll the server until `instance_id` is no longer resident.
+
+    Returns (gone, seconds_waited). The HTTP 200 from /unload arrives while the
+    model is still tearing down, so "did it work?" is answered by the model
+    LIST, never by the receipt.
+    """
+    start = time.monotonic()
+    while (time.monotonic() - start) < timeout_s:
+        if not any(i["id"] == instance_id for i in live_loaded_instances()):
+            return True, time.monotonic() - start
+        time.sleep(step_s)
+    return False, time.monotonic() - start
+
+
 def list_models_internal() -> dict[str, Any]:
     config = get_config()
     endpoint, result = try_endpoints("GET", config["lmstudio"]["model_list_endpoints"])
@@ -756,67 +923,26 @@ def load_model_internal(model_name: str) -> dict[str, Any]:
         last_result = result
     if not last_result or not last_result.ok:
         return {"ok": False, "error": (last_result.error_message if last_result else "Load failed"), "status": (last_result.status if last_result else 0)}
+    # Record the instance id the SERVER minted, read live - not a guess, and
+    # not a stale `:<n>` suffix. On a re-load LM Studio appends `:<n>`, which is
+    # exactly what used to poison the cache and make the next unload 404.
+    live = live_loaded_instances(model_name)
+    discovered_instance_id = live[-1]["id"] if live else None
     state = get_state()
     state["loaded_model_name"] = model_name
-    discovered_instance_id: str | None = None
-    listed = list_models_internal()
-    if listed.get("ok"):
-        for model in listed.get("models", []):
-            if model.get("id") == model_name:
-                instances = model.get("loaded_instances", [])
-                if instances:
-                    discovered_instance_id = instances[-1].get("id")
-                break
     state["loaded_instance_id"] = discovered_instance_id
     save_state(state)
     invalidate_chat_endpoint_cache()
-    log_event("model_loaded", {"model": model_name, "endpoint": used_endpoint})
-    return {"ok": True, "endpoint": used_endpoint, "response": last_result.data, "loaded_model_name": model_name}
+    log_event("model_loaded", {"model": model_name, "endpoint": used_endpoint,
+                               "instance_id": discovered_instance_id})
+    if not discovered_instance_id:
+        log_event("model_load_unverified", {"model": model_name, "endpoint": used_endpoint})
+    return {"ok": True, "endpoint": used_endpoint, "response": last_result.data,
+            "loaded_model_name": model_name, "instance_id": discovered_instance_id,
+            "verified": bool(discovered_instance_id)}
 
 
-def unload_model_internal(model_name: str | None = None) -> dict[str, Any]:
-    state = get_state()
-    target_model = model_name or state.get("loaded_model_name")
-    config = get_config()
-    instance_id = state.get("loaded_instance_id")
-    if not instance_id and target_model:
-        listed = list_models_internal()
-        if listed.get("ok"):
-            for model in listed.get("models", []):
-                if model.get("id") == target_model:
-                    instances = model.get("loaded_instances", [])
-                    if instances:
-                        instance_id = instances[0].get("id")
-                    break
-    payload_candidates = []
-    if instance_id:
-        payload_candidates.append({"instance_id": instance_id})
-    if target_model:
-        payload_candidates.extend([{"model": target_model}, {"identifier": target_model}])
-    if not payload_candidates:
-        payload_candidates = [{}]
-    last_result = None
-    used_endpoint = None
-    for payload in payload_candidates:
-        endpoint, result = try_endpoints("POST", config["lmstudio"]["model_unload_endpoints"], payload=payload, timeout=120)
-        if result.ok:
-            used_endpoint = endpoint
-            last_result = result
-            break
-        last_result = result
-    if not last_result or not last_result.ok:
-        return {"ok": False, "error": (last_result.error_message if last_result else "Unload failed"), "status": (last_result.status if last_result else 0)}
-    if target_model and target_model == state.get("loaded_model_name"):
-        state["loaded_model_name"] = None
-        state["loaded_instance_id"] = None
-        save_state(state)
-    elif target_model is None:
-        state["loaded_model_name"] = None
-        state["loaded_instance_id"] = None
-        save_state(state)
-    invalidate_chat_endpoint_cache()
-    log_event("model_unloaded", {"model": target_model, "endpoint": used_endpoint})
-    return {"ok": True, "endpoint": used_endpoint, "response": last_result.data, "unloaded_model_name": target_model}
+
 
 
 def score_text(output: str, keywords: list[str]) -> float:
@@ -1630,38 +1756,101 @@ def best_model_for_task(category: str = "general") -> dict[str, Any]:
     return best_model_for_task_internal(category=category)
 
 
+def _model_busy(listed: dict, instance_id: str) -> bool:
+    """Best-effort busy detection. Prefer a real 'active/generating' flag from
+    LM Studio's /api/v1/models per-instance payload; fall back to `lms ps`
+    STATUS column; final fallback is conservative True (never unload)."""
+    for model in listed.get("models", []):
+        for inst in model.get("loaded_instances", []):
+            if inst.get("id", model.get("id")) != instance_id:
+                continue
+            for key in ("active", "busy", "generating", "state", "inference"):
+                val = inst.get(key)
+                if val is not None:
+                    if isinstance(val, bool):
+                        return val
+                    if isinstance(val, str):
+                        return val.lower() not in ("idle", "loaded", "ready", "")
+            break
+    config = get_config()
+    lms_path = str(config.get("lms_path", Path.home() / ".lmstudio" / "bin" / "lms.exe"))
+    if not os.path.exists(lms_path):
+        return True  # no signal available → assume busy (safe)
+    try:
+        out = subprocess.run(
+            [lms_path, "ps"], capture_output=True, text=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout
+        for line in out.splitlines()[2:]:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            ident, status = parts[0], parts[2]
+            if ident != instance_id:
+                continue
+            return status.strip().upper() not in ("IDLE", "LOADED", "READY")
+    except Exception:
+        return True  # lms unavailable → assume busy (safe)
+    return True  # instance not found via lms → assume busy (safe)
+
+
 def _aux_unload_watchdog() -> None:
-    """Background thread: periodically unload any model that isn't the main model."""
+    """Per Amir's rule (2026-07-31): load on request, stay while idle,
+    unload only after `auto_unload_interval_seconds` idle, never mid-job,
+    protect main_model (the compression model Hermes uses)."""
+    last_seen: dict[str, float] = {}
     while True:
-        time.sleep(30)
         try:
             config = get_config()
             if not config.get("auto_unload_aux", True):
+                last_seen.clear()
+                time.sleep(int(config.get("auto_unload_interval_seconds", 60)))
                 continue
+            interval = max(5, int(config.get("auto_unload_interval_seconds", 60)))
+            time.sleep(interval)
             main_model = config.get("main_model", "")
-            if not main_model:
-                continue
             listed = list_models_internal()
             if not listed.get("ok"):
                 continue
+            now = time.monotonic()
+            loaded: dict[str, str] = {}
             for model in listed.get("models", []):
                 instances = model.get("loaded_instances", [])
                 if not instances:
                     continue
                 model_id = model.get("id", "")
-                if model_id == main_model:
-                    continue
                 for inst in instances:
-                    inst_id = inst.get("id", model_id)
-                    payload = {"instance_id": inst_id}
-                    config2 = get_config()
-                    endpoint, result = try_endpoints("POST", config2["lmstudio"]["model_unload_endpoints"], payload=payload, timeout=30)
-                    if result.ok:
-                        print(f"[auto-unload] Unloaded auxiliary model: {inst_id}")
-                    else:
-                        print(f"[auto-unload] Failed to unload {inst_id}: {result.error_message}")
+                    loaded[inst.get("id", model_id)] = model_id
+            # forget models that disappeared
+            for mid in list(last_seen):
+                if mid not in loaded:
+                    del last_seen[mid]
+            # first time we see a loaded model = it just loaded → give it a job window
+            for mid in loaded:
+                if mid not in last_seen:
+                    last_seen[mid] = now
+                    print(f"[auto-unload] {mid} just loaded, idle clock starts", flush=True)
+            # unload candidates: NOT main_model, loaded for >= 2 intervals (idle), not busy
+            for mid, model_id in loaded.items():
+                if mid == main_model:
+                    continue
+                age = now - last_seen[mid]
+                if age < interval * 2:
+                    continue  # recently loaded — may be mid-job
+                if _model_busy(listed, mid):
+                    print(f"[auto-unload] {mid} appears busy, skipping unload", flush=True)
+                    continue
+                payload = {"instance_id": mid}
+                endpoint, result = try_endpoints(
+                    "POST", config["lmstudio"]["model_unload_endpoints"],
+                    payload=payload, timeout=30)
+                if result.ok:
+                    print(f"[auto-unload] Unloaded idle auxiliary model: {mid}", flush=True)
+                    last_seen.pop(mid, None)
+                else:
+                    print(f"[auto-unload] Failed to unload {mid}: {result.error_message}", flush=True)
         except Exception as exc:
-            print(f"[auto-unload] Watchdog error: {exc}")
+            print(f"[auto-unload] Watchdog error: {exc}", flush=True)
 
 
 def main() -> None:
